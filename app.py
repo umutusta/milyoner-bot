@@ -9,6 +9,8 @@ SERPAPI_KEY    = os.environ.get("SERPAPI_KEY", "")
 SESS = requests.Session()
 SESS.headers.update({"User-Agent": "milyoner-bot/1.0"})
 
+# -------------------- OpenAI helper --------------------
+
 def openai_chat(messages, model="gpt-4o-mini", temperature=0, max_tokens=220):
     r = SESS.post(
         "https://api.openai.com/v1/chat/completions",
@@ -21,14 +23,17 @@ def openai_chat(messages, model="gpt-4o-mini", temperature=0, max_tokens=220):
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
+# -------------------- Utils --------------------
+
 def is_negated(q: str) -> bool:
     ql = q.lower()
-    return any(k in ql for k in [" değil", " değildir", " olmayan", " hangisi değildir", " hariç", " dışındadır", " yanlış olan"])
+    return any(k in ql for k in [" değil", " değildir", " olmayan",
+                                 " hangisi değildir", " hariç",
+                                 " dışındadır", " yanlış olan"])
 
-# ---------- Retrieval ----------
+# -------------------- Retrieval --------------------
 
 def wiki_search(question: str, limit: int = 3):
-    # Wikipedia search + summaries (Turkish)
     url = "https://tr.wikipedia.org/w/api.php"
     res = SESS.get(url, params={
         "action": "query", "list": "search", "srsearch": question,
@@ -43,13 +48,14 @@ def wiki_search(question: str, limit: int = 3):
         if s.ok:
             j = s.json()
             extracts.append({"title": title, "extract": j.get("extract","")})
-    return extracts  # list of dicts {title, extract}
+    return extracts
 
 def serpapi_google(query: str, num: int = 8):
     if not SERPAPI_KEY:
         return []
     r = SESS.get("https://serpapi.com/search.json", params={
-        "engine": "google", "q": query, "hl": "tr", "gl": "tr", "num": num, "api_key": SERPAPI_KEY
+        "engine": "google", "q": query, "hl": "tr", "gl": "tr",
+        "num": num, "api_key": SERPAPI_KEY
     }, timeout=8)
     if not r.ok:
         return []
@@ -63,23 +69,47 @@ def serpapi_google(query: str, num: int = 8):
         })
     return out
 
-def parallel_search(question: str, options):
-    # Run in parallel: wiki for the question, and Google for each (question + option)
-    tasks = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
-        tasks["wiki_q"] = ex.submit(wiki_search, question)
-        for label, text in options.items():
-            q = f"{question} {text}"
-            tasks[f"g_{label}"] = ex.submit(serpapi_google, q)
-    results = {k: v.result() for k, v in tasks.items()}
-    return results
+def serpapi_ai_overview(question: str):
+    """Fetch Google AI Overview (if available)."""
+    if not SERPAPI_KEY:
+        return []
+    try:
+        r = SESS.get("https://serpapi.com/search.json", params={
+            "engine": "google", "q": question,
+            "hl": "en", "gl": "us", "num": "8",
+            "api_key": SERPAPI_KEY
+        }, timeout=8)
+        r.raise_for_status()
+        j = r.json()
+        aio = j.get("ai_overview")
+        if not aio:
+            return []
+        # If token exists, fetch dedicated AIO
+        if "page_token" in aio:
+            r2 = SESS.get("https://serpapi.com/search.json", params={
+                "engine": "google_ai_overview",
+                "page_token": aio["page_token"],
+                "api_key": SERPAPI_KEY
+            }, timeout=8)
+            r2.raise_for_status()
+            aio = r2.json().get("ai_overview", aio)
 
-# ---------- Scoring ----------
+        snippets = []
+        for tb in aio.get("text_blocks", []):
+            if tb.get("text"):
+                snippets.append(tb["text"])
+        for ref in aio.get("references", []):
+            title, link = ref.get("title",""), ref.get("link","")
+            if title or link:
+                snippets.append(f"{title} {link}".strip())
+        return snippets
+    except Exception as e:
+        return [f"AIO fetch failed: {e}"]
+
+# -------------------- Scoring --------------------
 
 def simple_score(option_text: str, blobs: list[str]) -> int:
-    """Count rough matches of key terms from option_text inside blobs."""
     opt = option_text.lower()
-    # split to keywords (ignore tiny tokens)
     toks = [t for t in re.split(r"[^0-9a-zçğıöşüâîû]+", opt) if len(t) > 2]
     score = 0
     for b in blobs:
@@ -89,12 +119,23 @@ def simple_score(option_text: str, blobs: list[str]) -> int:
                 score += 1
     return score
 
-def build_evidence(results, options):
-    # Flatten text blobs per option
-    blobs_per_opt = {k: [] for k in options}
+def build_evidence(question: str, options):
+    # Run wiki + google in parallel
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        futs = {
+            "wiki": ex.submit(wiki_search, question),
+        }
+        for label, text in options.items():
+            futs[f"g_{label}"] = ex.submit(serpapi_google, f"{question} {text}")
+        for k, f in futs.items():
+            results[k] = f.result()
+
+    # Collect blobs
     global_blobs = []
-    for w in results.get("wiki_q", []):
+    for w in results.get("wiki", []):
         global_blobs.append(f"{w['title']}: {w['extract']}")
+    blobs_per_opt = {k: [] for k in options}
     for k, items in results.items():
         if k.startswith("g_"):
             label = k.split("_",1)[1]
@@ -102,13 +143,15 @@ def build_evidence(results, options):
                 txt = f"{it['title']} — {it['snippet']}"
                 blobs_per_opt[label].append(txt)
                 global_blobs.append(txt)
+
     # Scores
     scores = {}
     for label, text in options.items():
         scores[label] = simple_score(text, blobs_per_opt[label] + global_blobs)
+
     return scores, global_blobs
 
-# ---------- Flask endpoints ----------
+# -------------------- Flask endpoints --------------------
 
 @app.get("/health")
 def health():
@@ -134,60 +177,64 @@ def answer():
             model="gpt-4o-mini", max_tokens=320
         )
 
-        # Parse back question & options
+        # Parse question & options
         qm = re.search(r"Question:\s*(.+?\?)", cleaned, flags=re.S|re.I)
         question = (qm.group(1).strip() if qm else cleaned.strip())
         def opt(label):
             m = re.search(rf"^{label}\)\s*(.+)$", cleaned, flags=re.M)
             return (m.group(1).strip() if m else "")
-        options = { "A": opt("A"), "B": opt("B"), "C": opt("C"), "D": opt("D") }
+        options = { "A": opt("A"), "B": opt("B"),
+                    "C": opt("C"), "D": opt("D") }
 
-        # Step B: retrieval (parallel)
-        results = parallel_search(question, options)
-
-        # Step C: scoring + negation handling
-        scores, corpus = build_evidence(results, options)
+        # Step B: first retrieval & scoring
+        scores, corpus = build_evidence(question, options)
         neg = is_negated(question)
 
-        # Step D: evidence-only finalization by GPT (with our scores)
+        # Step C: GPT final answer (first pass)
         sys_final = (
             "You are a strict verifier. Choose the correct option USING ONLY the supplied evidence.\n"
-            "Turkish MCQ with A–D is given, plus evidence snippets and precomputed integer scores per option.\n"
             "Rules:\n"
             "1) If the question is negated (değil/olmayan/hariç/dışında/yanlış), pick the option with the WEAKEST support.\n"
             "2) Otherwise pick the option with the STRONGEST support.\n"
-            "3) Prefer options whose key terms appear in multiple independent snippets.\n"
-            "4) If tie, break by the provided numeric score.\n"
-            "5) Output only one line: 'A) Option text [CONF:##]'. No explanation."
+            "3) Break ties using numeric scores.\n"
+            "4) Output one line: 'A) Option text [CONF:##]'."
         )
         user_final = {
             "question": question,
             "options": options,
             "negated": neg,
             "scores": scores,
-            "snippets": corpus[:20]  # cap for token safety
+            "snippets": corpus[:20]
         }
-        final = openai_chat(
+        first = openai_chat(
             [{"role":"system","content":sys_final},
              {"role":"user","content":json.dumps(user_final, ensure_ascii=False)}],
             model="gpt-4.1", max_tokens=80
         )
 
-        # Extract structured output
-        ans_match  = re.search(r"^[ABCD]\)\s.*?(?=\s*\[CONF:)", final, flags=re.S|re.M)
-        conf_match = re.search(r"\[CONF:\s*(\d{1,3})\s*\]", final)
-        answer_line = (ans_match.group(0).strip() if ans_match else final.strip())
+        ans_match  = re.search(r"^[ABCD]\)\s.*?(?=\s*\[CONF:)", first, flags=re.S|re.M)
+        conf_match = re.search(r"\[CONF:\s*(\d{1,3})\s*\]", first)
+        answer_line = (ans_match.group(0).strip() if ans_match else first.strip())
         conf = int(conf_match.group(1)) if conf_match else None
 
-        # Confidence gate: if still low, signal it
-        if conf is not None and conf < 70:
-            answer_line = answer_line + "  (low evidence)"
+        # Step D: If confidence is low, try AI Overview
+        if conf is None or conf < 70:
+            aio_snips = serpapi_ai_overview(question)
+            if aio_snips:
+                user_final["snippets"] = (corpus + aio_snips)[:30]
+                retry = openai_chat(
+                    [{"role":"system","content":sys_final},
+                     {"role":"user","content":json.dumps(user_final, ensure_ascii=False)}],
+                    model="gpt-4.1", max_tokens=80
+                )
+                ans_match  = re.search(r"^[ABCD]\)\s.*?(?=\s*\[CONF:)", retry, flags=re.S|re.M)
+                conf_match = re.search(r"\[CONF:\s*(\d{1,3})\s*\]", retry)
+                answer_line = (ans_match.group(0).strip() if ans_match else retry.strip())
+                conf = int(conf_match.group(1)) if conf_match else conf
 
-        return jsonify(answer=answer_line, confidence=conf, cleaned_mcq=f"Question: {question}\nA) {options['A']}\nB) {options['B']}\nC) {options['C']}\nD) {options['D']}")
+        return jsonify(answer=answer_line,
+                       confidence=conf,
+                       cleaned_mcq=f"Question: {question}\nA) {options['A']}\nB) {options['B']}\nC) {options['C']}\nD) {options['D']}")
 
     except Exception as e:
-        try:
-            # Best-effort JSON for any failure
-            return jsonify(error=type(e).__name__, message=str(e)) , 500
-        except Exception:
-            return ("{}", 500, {"Content-Type": "application/json"})
+        return jsonify(error=type(e).__name__, message=str(e)), 500
