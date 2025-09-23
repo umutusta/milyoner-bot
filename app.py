@@ -4,7 +4,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-SERPAPI_KEY    = os.environ.get("SERPAPI_KEY", "")
+SERPAPI_KEY    = os.environ.get("f59608f6288ba71a5fc6567b0ef4de425c4bef3cb0eed5acf28e318b4b0e2a44", "")
 
 SESS = requests.Session()
 SESS.headers.update({"User-Agent": "milyoner-bot/1.0"})
