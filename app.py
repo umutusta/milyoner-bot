@@ -5,9 +5,9 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # ----------- ENV / CLIENTS -----------
-OPENAI_API_KEY      = os.getenv("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", "")
-SERPAPI_KEY         = os.getenv("6a0271854a1a6403635d6b77f46a5daffdcc99110e7c389ae48cc5e0761a8611", "")           # <- fixed
-PERPLEXITY_API_KEY  = os.getenv("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", "")   # optional fallback
+OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY", "")
+SERPAPI_KEY         = os.getenv("SERPAPI_KEY", "")           # <- fixed
+PERPLEXITY_API_KEY  = os.getenv("PERPLEXITY_API_KEY", "")   # optional fallback
 
 SESS = requests.Session()
 SESS.headers.update({"User-Agent": "bilmatik-bot/1.2"})
