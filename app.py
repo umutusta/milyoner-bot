@@ -1,18 +1,25 @@
-import os, re, json, time, math, requests, concurrent.futures
+import os, re, json, time, math, logging, requests, concurrent.futures
 from functools import lru_cache
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+# ----------- LOGGER SETUP -----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("bilmatik-bot")
+
 # ----------- ENV / CLIENTS -----------
 OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY", "")
-SERPAPI_KEY         = os.getenv("SERPAPI_KEY", "")           # <- fixed
-PERPLEXITY_API_KEY  = os.getenv("PERPLEXITY_API_KEY", "")   # optional fallback
+SERPAPI_KEY         = os.getenv("SERPAPI_KEY", "")
+PERPLEXITY_API_KEY  = os.getenv("PERPLEXITY_API_KEY", "")
 
 SESS = requests.Session()
-SESS.headers.update({"User-Agent": "bilmatik-bot/1.2"})
+SESS.headers.update({"User-Agent": "bilmatik-bot/1.3"})
 
-# Global time budget per request (Bilmatik shows 10s; keep some headroom)
 TOTAL_BUDGET_SEC = 9.5
 
 # ----------- UTILITIES -----------
@@ -22,24 +29,19 @@ NEG_PATTERNS = [
     " dışındadır", " yanlış olan", " değildir?"
 ]
 
+def now(): return time.perf_counter()
+def time_left(start): return max(0.0, TOTAL_BUDGET_SEC - (now() - start))
+def clamp(n, lo, hi): return max(lo, min(hi, n))
+
 def is_negated(q: str) -> bool:
     ql = (" " + q.lower() + " ")
     return any(p in ql for p in NEG_PATTERNS)
-
-def now() -> float:
-    return time.perf_counter()
-
-def time_left(start: float) -> float:
-    return max(0.0, TOTAL_BUDGET_SEC - (now() - start))
-
-def clamp(n, lo, hi):
-    return max(lo, min(hi, n))
 
 def only_letter(s: str) -> str:
     m = re.search(r"\b([ABCD])\b", s.strip(), flags=re.I)
     return m.group(1).upper() if m else s.strip()
 
-# ----------- OPENAI (tight & deterministic) -----------
+# ----------- OPENAI -----------
 
 def openai_chat(messages, model="gpt-4o-mini", temperature=0, max_tokens=48, timeout=4.5):
     if not OPENAI_API_KEY:
@@ -75,7 +77,8 @@ def wiki_search_cached(question: str, limit: int = 3):
                 j = s.json()
                 extracts.append({"title": title, "extract": j.get("extract","")})
         return extracts
-    except Exception:
+    except Exception as e:
+        log.warning(f"Wiki search failed: {e}")
         return []
 
 def serpapi_google(query: str, num: int = 6):
@@ -89,36 +92,26 @@ def serpapi_google(query: str, num: int = 6):
         if not r.ok:
             return []
         j = r.json()
-        out = []
-        for it in j.get("organic_results", []):
-            out.append({
-                "title": it.get("title",""),
-                "snippet": it.get("snippet",""),
-                "link": it.get("link","")
-            })
-        return out
-    except Exception:
+        return [
+            {"title": it.get("title",""), "snippet": it.get("snippet","")}
+            for it in j.get("organic_results", [])
+        ]
+    except Exception as e:
+        log.warning(f"SerpAPI failed: {e}")
         return []
 
 def perplexity_mcq(question: str, options: dict, timeout: float = 4.0):
-    """
-    Ultra-fast web-grounded fallback. Returns a single letter if successful.
-    Requires PERPLEXITY_API_KEY.
-    """
     if not PERPLEXITY_API_KEY or timeout <= 0.1:
         return None
-
     try:
         prompt = (
-            "Soru ve şıklar çoktan seçmeli bir bilgi yarışmasından. "
-            "Web araması yaparak hızlıca doğru cevabı bul ve SADECE harf döndür (A/B/C/D). "
-            "Açıklama yazma.\n\n"
+            "Türkçe bilgi yarışması sorusu. "
+            "Web araması yaparak doğru şıkkı bul ve sadece harf döndür (A/B/C/D).\n\n"
             f"Soru: {question}\n"
             f"A) {options.get('A','')}\n"
             f"B) {options.get('B','')}\n"
             f"C) {options.get('C','')}\n"
-            f"D) {options.get('D','')}\n"
-            "Cevap:"
+            f"D) {options.get('D','')}\nCevap:"
         )
         r = SESS.post(
             "https://api.perplexity.ai/chat/completions",
@@ -126,20 +119,16 @@ def perplexity_mcq(question: str, options: dict, timeout: float = 4.0):
                 "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
                 "Content-Type": "application/json"
             },
-            json={
-                "model": "sonar",                 # fast, search-enabled
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 4,
-                "temperature": 0,
-                "return_citations": True
-            },
+            json={"model": "sonar", "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": 4, "temperature": 0, "return_citations": True},
             timeout=timeout
         )
         if not r.ok:
             return None
         txt = r.json()["choices"][0]["message"]["content"]
         return only_letter(txt)
-    except Exception:
+    except Exception as e:
+        log.warning(f"Perplexity error: {e}")
         return None
 
 # ----------- SCORING -----------
@@ -156,24 +145,22 @@ def simple_score(option_text: str, blobs: list[str]) -> int:
     return score
 
 def build_evidence(question: str, options, time_budget_left: float):
-    # Cap time for retrieval to avoid overruns
-    # Wiki (2.3s) + parallel Google per option (2.8s each) under a thread pool
     results = {}
-    max_workers = 1 + sum(1 for _ in options)  # wiki + 4 options
-    budget_ok = time_budget_left > 2.0
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=(max_workers if budget_ok else 2)) as ex:
+    start_t = now()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
         futs = {"wiki": ex.submit(wiki_search_cached, question)}
-        if budget_ok and SERPAPI_KEY:
+        if SERPAPI_KEY:
             for label, text in options.items():
                 futs[f"g_{label}"] = ex.submit(serpapi_google, f"{question} {text}")
         for k, f in futs.items():
             try:
                 results[k] = f.result(timeout=3.0)
-            except Exception:
+            except Exception as e:
+                log.warning(f"{k} retrieval failed: {e}")
                 results[k] = []
+    elapsed = now() - start_t
+    log.info(f"Retrieval done in {elapsed:.2f}s")
 
-    # Collect blobs
     global_blobs = []
     for w in results.get("wiki", []) or []:
         if w.get("extract"):
@@ -186,24 +173,18 @@ def build_evidence(question: str, options, time_budget_left: float):
                 txt = f"{it.get('title','')} — {it.get('snippet','')}"
                 blobs_per_opt[label].append(txt)
                 global_blobs.append(txt)
-
-    # Scores
-    scores = {}
-    for label, text in options.items():
-        scores[label] = simple_score(text, (blobs_per_opt[label] + global_blobs)[:40])
-
+    scores = {label: simple_score(text, blobs_per_opt[label] + global_blobs)
+              for label, text in options.items()}
     return scores, global_blobs[:40]
 
-# ----------- FLASK -----------
+# ----------- FLASK ENDPOINT -----------
 
 @app.get("/health")
 def health():
-    return jsonify(
-        ok=True,
-        has_openai=bool(OPENAI_API_KEY),
-        has_serp=bool(SERPAPI_KEY),
-        has_perplexity=bool(PERPLEXITY_API_KEY)
-    )
+    return jsonify(ok=True,
+                   has_openai=bool(OPENAI_API_KEY),
+                   has_serp=bool(SERPAPI_KEY),
+                   has_perplexity=bool(PERPLEXITY_API_KEY))
 
 @app.post("/answer")
 def answer():
@@ -213,13 +194,14 @@ def answer():
         raw = (data.get("ocr_text") or "").strip()
         if not raw:
             return jsonify(error="missing ocr_text"), 400
+        log.info(f"Received OCR text ({len(raw)} chars)")
 
-        # A) Normalize OCR → MCQ (tight format, fast model)
+        # STEP A – cleanup
         sys_cleanup = (
-            "Aşağıdaki ham OCR metnini düzgün bir Türkçe çoktan seçmeli formata çevir.\n"
-            "Çıktı ŞABLONU (aynı satırlarla):\n"
+            "OCR'den gelen karışık metni düzgün Türkçe MCQ formatına çevir:\n"
             "Question: ...?\nA) ...\nB) ...\nC) ...\nD) ..."
         )
+        t0 = now()
         cleaned = openai_chat(
             [{"role":"system","content":sys_cleanup},
              {"role":"user","content":raw}],
@@ -227,6 +209,7 @@ def answer():
             max_tokens=220,
             timeout=min(3.5, time_left(start))
         )
+        log.info(f"StepA: Cleaned OCR in {now()-t0:.2f}s")
 
         # Parse
         qm = re.search(r"Question:\s*(.+?\?)", cleaned, flags=re.S|re.I)
@@ -236,35 +219,24 @@ def answer():
             return (m.group(1).strip() if m else "")
         options = { "A": opt("A"), "B": opt("B"), "C": opt("C"), "D": opt("D") }
 
-        # If options look empty (rare OCR failure), try to extract letters inline
-        if sum(1 for v in options.values() if v) < 2:
-            # last-chance: split lines starting with A)/B)/C)/D)
-            lines = [ln.strip() for ln in raw.splitlines()]
-            for L in ("A)","B)","C)","D)"):
-                for ln in lines:
-                    if ln.startswith(L):
-                        options[L[0]] = ln[len(L):].strip()
-
-        # B) Retrieval & scoring (respect time budget)
+        # STEP B – retrieval
         scores, corpus = build_evidence(question, options, time_left(start))
-        neg = is_negated(question)
+        log.info(f"StepB: Scores: {scores}")
 
-        # C) First pass answer (STRICT: only letter)
+        neg = is_negated(question)
+        log.info(f"Negation detected: {neg}")
+
+        # STEP C – decision
         sys_final = (
-            "SANA VERİLEN KANIT DIŞINA ÇIKMA.\n"
-            "Kurallar:\n"
-            "1) Soru olumsuzsa (değil/olmayan/hariç/dışında/yanlış), EN DÜŞÜK desteği olan şıkkı seç.\n"
-            "2) Aksi halde EN YÜKSEK desteği olan şıkkı seç.\n"
-            "3) Eşitlikte sayısal skorları kullan.\n"
-            "4) SADECE harfi döndür: A veya B veya C veya D. Açıklama yazma."
+            "Verilen kanıta göre doğru şıkkı seç.\n"
+            "Eğer olumsuz (değil/olmayan) varsa en düşük destekli şıkkı seç.\n"
+            "Sadece A/B/C/D döndür."
         )
         user_payload = {
-            "question": question,
-            "options": options,
-            "negated": neg,
-            "scores": scores,
-            "snippets": corpus[:20]
+            "question": question, "options": options,
+            "negated": neg, "scores": scores, "snippets": corpus[:20]
         }
+        t1 = now()
         first = openai_chat(
             [{"role":"system","content":sys_final},
              {"role":"user","content":json.dumps(user_payload, ensure_ascii=False)}],
@@ -273,28 +245,26 @@ def answer():
             timeout=min(2.2, time_left(start))
         )
         answer_letter = only_letter(first)
+        log.info(f"StepC: Model picked {answer_letter} in {now()-t1:.2f}s")
 
-        # D) Heuristic confidence (fast)
-        try:
-            top = max(scores.values()) if scores else 0
-            bot = min(scores.values()) if scores else 0
-            spread = abs(top - bot)
-            conf = 50 + clamp(7 * spread, 0, 45)  # 50–95 crude band
-            if neg:
-                conf = max(40, conf - 5)
-        except Exception:
-            conf = 60
+        # Confidence
+        top, bot = max(scores.values()), min(scores.values())
+        conf = 50 + clamp(7 * abs(top - bot), 0, 45)
+        if neg: conf = max(40, conf - 5)
 
-        # E) Low-confidence web fallback (Perplexity), only if time permits
+        # STEP D – fallback
         if conf < 70 and time_left(start) > 4.2:
-            px = perplexity_mcq(question, options, timeout=min(4.0, time_left(start) - 0.1))
+            log.info("Low confidence -> using Perplexity fallback")
+            px = perplexity_mcq(question, options, timeout=min(4.0, time_left(start)-0.1))
             if px in ("A","B","C","D"):
-                answer_letter = px
-                conf = max(conf, 78)  # bump if we got a clean, grounded letter
+                answer_letter, conf = px, max(conf, 78)
+                log.info(f"StepD: Perplexity changed answer -> {px}")
 
-        # Final packaging for your Shortcut
-        cleaned_mcq = f"Question: {question}\nA) {options.get('A','')}\nB) {options.get('B','')}\nC) {options.get('C','')}\nD) {options.get('D','')}"
+        cleaned_mcq = f"Question: {question}\nA) {options['A']}\nB) {options['B']}\nC) {options['C']}\nD) {options['D']}"
+        log.info(f"Final: {answer_letter} ({int(conf)}%) | total {now()-start:.2f}s")
+
         return jsonify(answer=answer_letter, confidence=int(conf), cleaned_mcq=cleaned_mcq)
 
     except Exception as e:
+        log.exception("Error in /answer")
         return jsonify(error=type(e).__name__, message=str(e)), 500
